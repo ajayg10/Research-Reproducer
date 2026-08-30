@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../storage:/app/storage
+      - ../generated:/app/generated
+      - ../sandbox:/app/sandbox
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-in-Docker sandbox
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash-exp}
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+      - ENVIRONMENT=local
+      - DATABASE_URL=sqlite:///./storage/reproducibility.db
+      - STORAGE_TYPE=local
+      - STORAGE_PATH=./storage
+      - SANDBOX_TYPE=docker
+      - SANDBOX_TIMEOUT=600
+      - SANDBOX_CPU_LIMIT=2.0
+      - SANDBOX_MEMORY_LIMIT=4g
+      - SANDBOX_NETWORK_ENABLED=false
+      - MAX_RETRIES=3
+      - RETRY_DELAY=5
+      - LOG_LEVEL=INFO
+    depends_on:
+      - frontend
+    networks:
+      - reproducibility-net
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000/api
+    networks:
+      - reproducibility-net
+
+networks:
+  reproducibility-net:
+    driver: bridge
