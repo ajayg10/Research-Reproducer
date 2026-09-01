@@ -41,6 +41,7 @@ class GeminiClient:
         response_schema: Type[T],
         temperature: float = 0.2,
         max_retries: int = 3,
+        files: Optional[list] = None,
     ) -> Optional[T]:
         """
         Generate structured output conforming to a Pydantic schema.
@@ -50,21 +51,15 @@ class GeminiClient:
             response_schema: Pydantic model class for response validation
             temperature: Generation temperature (0.0 - 1.0)
             max_retries: Maximum number of retry attempts
+            files: Optional list of uploaded Gemini files
 
         Returns:
             Validated Pydantic model instance or None on failure
         """
-        # Build prompt with JSON schema instructions
-        schema_json = response_schema.model_json_schema()
-
-        full_prompt = f"""{prompt}
-
-You must respond with ONLY valid JSON that conforms to this schema:
-
-{json.dumps(schema_json, indent=2)}
-
-Do not include any explanatory text before or after the JSON.
-Respond with valid JSON only."""
+        contents = []
+        if files:
+            contents.extend(files)
+        contents.append(prompt)
 
         for attempt in range(max_retries):
             try:
@@ -72,14 +67,17 @@ Respond with valid JSON only."""
                     "gemini_request",
                     attempt=attempt + 1,
                     max_retries=max_retries,
-                    temperature=temperature
+                    temperature=temperature,
+                    has_files=bool(files)
                 )
 
                 response = self.model.generate_content(
-                    full_prompt,
+                    contents,
                     generation_config=genai.types.GenerationConfig(
                         temperature=temperature,
                         candidate_count=1,
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
                     ),
                     safety_settings=self.safety_settings
                 )
@@ -91,14 +89,8 @@ Respond with valid JSON only."""
 
                 text = response.text.strip()
 
-                # Try to extract JSON if wrapped in markdown
-                if text.startswith("```"):
-                    lines = text.split("\n")
-                    text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
-
                 # Parse and validate JSON
-                data = json.loads(text)
-                validated = response_schema.model_validate(data)
+                validated = response_schema.model_validate_json(text)
 
                 logger.info(
                     "gemini_success",
@@ -107,14 +99,6 @@ Respond with valid JSON only."""
                 )
 
                 return validated
-
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    "json_parse_error",
-                    attempt=attempt + 1,
-                    error=str(e),
-                    response_preview=text[:200] if 'text' in locals() else None
-                )
 
             except Exception as e:
                 logger.error(

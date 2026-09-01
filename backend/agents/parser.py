@@ -8,6 +8,9 @@ from backend.models.state import AgentType
 from backend.models.schemas import ParserOutput, PaperSpecification
 from backend.services.gemini_client import gemini_client
 from backend.services.pdf_processor import pdf_processor
+import google.generativeai as genai
+import asyncio
+from pathlib import Path
 
 
 logger = structlog.get_logger()
@@ -44,26 +47,48 @@ class ParserAgent(BaseAgent[Dict[str, Any], ParserOutput]):
             )
 
         try:
-            # Extract text from PDF
-            self.logger.info("extracting_pdf", source=paper_source)
-            paper_text = await pdf_processor.extract_text(paper_source)
-
-            if not paper_text:
-                return ParserOutput(
-                    success=False,
-                    error="Failed to extract text from PDF"
+            gemini_file = None
+            paper_text = ""
+            files = None
+            
+            if Path(paper_source).exists():
+                # Upload directly to Gemini for native parsing
+                self.logger.info("uploading_pdf", source=paper_source)
+                loop = asyncio.get_event_loop()
+                gemini_file = await loop.run_in_executor(
+                    None, lambda: genai.upload_file(path=paper_source)
                 )
+                files = [gemini_file]
+                prompt = self._build_parsing_prompt("")
+            else:
+                # Fallback to pdf processor (e.g. if we download it in processor, though processor currently assumes local)
+                self.logger.info("extracting_pdf", source=paper_source)
+                paper_text = await pdf_processor.extract_text(paper_source)
 
-            # Build parsing prompt
-            prompt = self._build_parsing_prompt(paper_text)
+                if not paper_text:
+                    return ParserOutput(
+                        success=False,
+                        error="Failed to extract text from PDF and file does not exist locally"
+                    )
+
+                # Build parsing prompt
+                prompt = self._build_parsing_prompt(paper_text)
 
             # Call Gemini for structured extraction
             self.logger.info("calling_gemini_for_parsing")
             specification = await gemini_client.generate_structured(
                 prompt=prompt,
                 response_schema=PaperSpecification,
-                temperature=0.1  # Low temperature for accurate extraction
+                temperature=0.1,  # Low temperature for accurate extraction
+                files=files
             )
+
+            # Cleanup uploaded file
+            if gemini_file:
+                try:
+                    await loop.run_in_executor(None, lambda: genai.delete_file(gemini_file.name))
+                except Exception as cleanup_err:
+                    self.logger.warning("failed_to_delete_gemini_file", error=str(cleanup_err))
 
             if not specification:
                 return ParserOutput(
@@ -81,21 +106,27 @@ class ParserAgent(BaseAgent[Dict[str, Any], ParserOutput]):
                 success=True,
                 specification=specification,
                 extraction_metadata={
-                    "paper_length_chars": len(paper_text),
-                    "ambiguities_detected": len(specification.ambiguities)
+                    "paper_length_chars": len(paper_text) if paper_text else 0,
+                    "ambiguities_detected": len(specification.ambiguities),
+                    "parsed_via_file_api": bool(gemini_file)
                 }
             )
 
         except Exception as e:
             self.logger.error("parser_execution_error", error=str(e))
+            if 'gemini_file' in locals() and gemini_file:
+                try:
+                    genai.delete_file(gemini_file.name)
+                except:
+                    pass
             return ParserOutput(
                 success=False,
                 error=f"Parser execution failed: {str(e)}"
             )
 
-    def _build_parsing_prompt(self, paper_text: str) -> str:
+    def _build_parsing_prompt(self, paper_text: str = "") -> str:
         """Build the parsing prompt for Gemini."""
-        return f"""You are a research paper parser for a reproducibility engine.
+        base_prompt = """You are a research paper parser for a reproducibility engine.
 
 Extract a structured specification from the following research paper.
 
@@ -105,9 +136,6 @@ CRITICAL INSTRUCTIONS:
 3. Identify ambiguities where implementation details are unclear
 4. Do NOT hallucinate or invent values
 5. Focus on technical details needed for implementation
-
-PAPER TEXT:
-{paper_text}
 
 Extract:
 - Title and authors
@@ -124,6 +152,9 @@ Extract:
 
 If a section is not present or unclear, explicitly mark it as such.
 """
+        if paper_text:
+            return f"{base_prompt}\n\nPAPER TEXT:\n{paper_text}"
+        return base_prompt
 
 
 # Global parser agent instance
